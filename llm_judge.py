@@ -7,9 +7,6 @@ License: MIT
 LLM-as-judge evaluator for reasoning benchmarks.
 Uses a language model to judge whether an answer matches the expected ground truth,
 rather than relying on brittle keyword/pattern matching.
-
-Designed to be imported and used alongside or as a replacement for the
-simple check functions in llm_examples_mstep_compressed_reasoning.py.
 """
 
 import re
@@ -40,39 +37,50 @@ if not JUDGE_MODEL and _available:
 # Judge prompt templates
 # ----------------------------------------------------------------------
 
-JUDGE_SYSTEM_PROMPT = """You are an expert evaluator of LLM reasoning answers. Your job is to judge whether a model's answer correctly matches the expected ground truth for a given question.
-
-Evaluate based on:
-1. **Correctness** — Does the answer reach the right conclusion? (Most important)
-2. **Reasoning quality** — Is the reasoning logical and complete?
-3. **Precision** — Is the answer specific and accurate?
-
-Be generous with partial credit — if the answer is essentially correct but worded differently, give full credit.
-Be strict about factual errors — if the answer is wrong, mark it as wrong even if the reasoning sounds plausible.
+JUDGE_SYSTEM_PROMPT = """You are an expert evaluator of LLM reasoning answers. Your job is to judge ground TRUTH vs a GIVEN ANSWER for a QUESTION. The TRUTH must not be questioned, and the model must be considered WRONG if there you are CONFLICTED. 
 
 Respond with a JSON object containing:
 - "correct": true/false — whether the answer is correct
 - "confidence": 0.0-1.0 — how confident you are in your judgment
+- "correctness": 0.0-1.0 
+- "reason_quality": 0.0-1.0 
+- "precision": 0.0-1.0 
+- "process": 0.0-1.0 
 - "reasoning": a brief explanation of your judgment
 - "matches_expected": true/false — whether the answer matches the expected display value
 """
 
-JUDGE_PROMPT_TEMPLATE = """Question: 
-==test_question==
+JUDGE_PROMPT_TEMPLATE = """<system>
+Evaluate based on:
+1. **Correctness** — Does the answer reach the right conclusion aka TRUTH? (Most important)
+2. **Reasoning quality** — Is the reasoning logical and complete?
+3. **Precision** — Is the answer specific and accurate to the TRUTH?
+4. **Process** - it's not just about the conclusion, was the process correct? (vital)
+
+Be strict about factual errors — if the answer is wrong, mark it as wrong even if the reasoning sounds plausible. 
+
+If the reasoning was wrong - answer is wrong. 
+
+GIVEN_QUESTION
+==question==
 {question}
-==/test_question==
+==/question==
 
-Expected correct answer / ground truth: 
-==ground_truth==
+GROUND_TRUTH:
+==TRUTH==
 {expected}
-==/ground_truth==
+==/TRUTH==
 
-Model's answer: 
-==model_answer==
+Given answer: 
+</system>
+
+<user>
+==PRESENTED_ANSWER==
 {answer}
-==/model_answer==
+==/PRESENTED_ANSWER==
+</user>
 
-Does the model's answer match the expected ground truth? Consider the answer correct if it reaches the same conclusion, even if worded differently. Be lenient with phrasing but strict with factual correctness. <ignore:no_think>
+Does the model's answer match the expected ground TRUTH including any detected processess and conclusions? The process is as important as the conclusion. Be lenient with phrasing but strict with factual correctness. <ignore:no_think>
 
 Respond with a JSON object:
 {{"correct": true/false, "confidence": 0.0-1.0, "reasoning": "...", "matches_expected": true/false}}
@@ -146,6 +154,10 @@ def llm_judge(
         expected=expected,
         answer=answer,
     )
+
+    # print("\n\n\n")
+    # print(prompt)
+    # print("\n\n\n")
 
     messages = [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
