@@ -8,11 +8,10 @@ LLM-as-judge evaluator for reasoning benchmarks.
 Uses a language model to judge whether an answer matches the expected ground truth,
 rather than relying on brittle keyword/pattern matching.
 """
-
 import re
 import json
 from typing import Callable
-from _inc_ollama import llm_nonstream, G_FAST_MODEL, G_REASONING_MODEL, ollama_get_models
+from _inc_ollama import llm_stream, G_FAST_MODEL, G_REASONING_MODEL, ollama_get_models
 
 # ----------------------------------------------------------------------
 # Judge model selection
@@ -142,7 +141,7 @@ def llm_judge(
 
     for attempt in range(max_retries + 1):
         try:
-            resp = llm_nonstream(messages, thinking=False, the_model=the_model)
+            resp = llm_stream(messages, thinking=False, the_model=the_model)
             text = resp["content"].strip()
 
             if verbose:
