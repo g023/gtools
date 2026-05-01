@@ -166,6 +166,23 @@ def _detect_loop_in_text(text: str, threshold: int = 4, window_size: int = 300) 
         if len(set(recent_sentences)) <= 2:
             return True
 
+    # block‑level verbatim repetition: detect long repeated blocks
+    # Catches long repeated paragraphs even without line breaks (e.g. wolf/goat/cabbage)
+    if len(text) >= 200:
+        # Look for the longest suffix that also appears earlier in the text
+        # This catches N copies of the same block regardless of alignment
+        for block_len in range(min(len(text) // 2, 500), 49, -1):
+            suffix = text[-block_len:]
+            # Check if this suffix appears earlier (not overlapping with itself)
+            earlier_pos = text[:-block_len].find(suffix)
+            if earlier_pos != -1:
+                return True
+            # Also check with stripped whitespace for robustness
+            suffix_stripped = suffix.strip()
+            if len(suffix_stripped) >= 50 and suffix_stripped != suffix:
+                if suffix_stripped in text[:-block_len]:
+                    return True
+
     return False
 
 def _estimate_usage(reasoning: str, content: str, time_taken: float, ttft: Optional[float] = None) -> Dict:
@@ -419,7 +436,7 @@ def llm_stream(
                 reason += reasoning
                 if verbose:
                     print(reasoning, end="", flush=True)
-                if len(reason) > 200 and _detect_loop_in_text(reason[-300:]):
+                if len(reason) > 200 and _detect_loop_in_text(reason):
                     loop = True
                     break
             if content_piece:
@@ -430,7 +447,7 @@ def llm_stream(
                 content += content_piece
                 if verbose:
                     print(content_piece, end="", flush=True)
-                if len(content) > 200 and _detect_loop_in_text(content[-300:]):
+                if len(content) > 200 and _detect_loop_in_text(content):
                     loop = True
                     break
             if (max_reasoning_tokens is not None
