@@ -7,7 +7,11 @@ License: MIT
 LLM-as-judge evaluator for reasoning benchmarks.
 Uses a language model to judge whether an answer matches the expected ground truth,
 rather than relying on brittle keyword/pattern matching.
+
+Designed to be imported and used alongside or as a replacement for the
+simple check functions in llm_examples_mstep_compressed_reasoning.py.
 """
+
 import re
 import json
 from typing import Callable
@@ -53,13 +57,22 @@ Respond with a JSON object containing:
 - "matches_expected": true/false — whether the answer matches the expected display value
 """
 
-JUDGE_PROMPT_TEMPLATE = """Question: {question}
+JUDGE_PROMPT_TEMPLATE = """Question: 
+==test_question==
+{question}
+==/test_question==
 
-Expected correct answer / ground truth: {expected}
+Expected correct answer / ground truth: 
+==ground_truth==
+{expected}
+==/ground_truth==
 
-Model's answer: {answer}
+Model's answer: 
+==model_answer==
+{answer}
+==/model_answer==
 
-Does the model's answer match the expected ground truth? Consider the answer correct if it reaches the same conclusion, even if worded differently. Be lenient with phrasing but strict with factual correctness.
+Does the model's answer match the expected ground truth? Consider the answer correct if it reaches the same conclusion, even if worded differently. Be lenient with phrasing but strict with factual correctness. <ignore:no_think>
 
 Respond with a JSON object:
 {{"correct": true/false, "confidence": 0.0-1.0, "reasoning": "...", "matches_expected": true/false}}
