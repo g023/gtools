@@ -130,57 +130,106 @@ def shuffle_sentences_outside_codeblocks(text: str) -> str:
 # IMPROVED LOOP DETECTION
 # ---------------------------------------------------------------------------
 def _detect_loop_in_text(text: str, threshold: int = 4, window_size: int = 300) -> bool:
-    if len(text) < 100:
+    """Intelligent loop detection that avoids false positives on legitimate content."""
+    if len(text) < 200:
         return False
 
-    # line‑level detection
+    # =========================================================================
+    # PHASE 1: Quick rejection for short, legitimate problem restatement
+    # =========================================================================
+    # If the entire output is under 300 chars, it's almost certainly a legitimate
+    # short response restating the problem, not a loop.
+    if len(text) < 300:
+        return False
+
+    # =========================================================================
+    # PHASE 2: Line-level detection (genuine identical line repetition)
+    # =========================================================================
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     if len(lines) >= threshold * 2:
-        if len(set(lines[-threshold:])) == 1:
+        # Only flag if LAST 4+ lines are verbatim identical (strong signal)
+        if len(set(lines[-threshold:])) == 1 and len(lines[-threshold:][0]) > 20:
             return True
-        for block_size in range(2, min(6, len(lines)//2 + 1)):
+
+        # Block-level: only flag if 4+ exact block repetitions
+        for block_size in range(2, min(7, len(lines)//3 + 1)):
             last_block = lines[-block_size:]
             repeats = 0
-            idx = len(lines) - block_size
-            while idx >= 0 and lines[idx:idx+block_size] == last_block:
-                repeats += 1
-                idx -= block_size
-            if repeats >= threshold:
+            idx = len(lines) - block_size - 1
+            while idx >= 0:
+                if lines[idx:idx+block_size] == last_block:
+                    repeats += 1
+                    idx -= block_size
+                else:
+                    break
+            # Require 4+ consecutive repetitions AND each line >20 chars (filter noise)
+            if repeats >= threshold and all(len(line) > 20 for line in last_block):
                 return True
 
-    # substring‑diversity in recent window
-    recent_text = text[-window_size:] if len(text) > window_size else text
-    if len(recent_text) >= 100:
-        unique_windows = set()
-        for i in range(len(recent_text) - 20 + 1):
-            unique_windows.add(recent_text[i:i+20])
-            if len(unique_windows) > 8:
-                break
-        if len(unique_windows) <= 5:
-            return True
-
-    # sentence repetition (nearby duplicates)
-    sentences = [s.strip() for s in re.split(r'[.!?]+', recent_text) if s.strip()]
-    if len(sentences) >= 4:
-        recent_sentences = sentences[-4:]
-        if len(set(recent_sentences)) <= 2:
-            return True
-
-    # block‑level verbatim repetition: detect long repeated blocks
-    # Catches long repeated paragraphs even without line breaks (e.g. wolf/goat/cabbage)
-    if len(text) >= 200:
-        # Look for the longest suffix that also appears earlier in the text
-        # This catches N copies of the same block regardless of alignment
-        for block_len in range(min(len(text) // 2, 500), 49, -1):
-            suffix = text[-block_len:]
-            # Check if this suffix appears earlier (not overlapping with itself)
-            earlier_pos = text[:-block_len].find(suffix)
-            if earlier_pos != -1:
+    # =========================================================================
+    # PHASE 3: Substring diversity in recent window (ONLY for very long text)
+    # =========================================================================
+    # Only check diversity if text is VERY long (over 1200 chars) - avoids false
+    # positives on short problem restatements with limited vocabulary.
+    if len(text) >= 1200:
+        recent_text = text[-window_size:] if len(text) > window_size else text
+        if len(recent_text) >= 150:  # Only if window has substantial content
+            unique_windows = set()
+            for i in range(len(recent_text) - 20 + 1):
+                unique_windows.add(recent_text[i:i+20])
+                if len(unique_windows) > 12:  # Raise threshold from 8 to 12
+                    break
+            # Only flag if diversity is EXTREMELY low AND text is long
+            if len(unique_windows) <= 3 and len(text) >= 1200:
                 return True
-            # Also check with stripped whitespace for robustness
-            suffix_stripped = suffix.strip()
-            if len(suffix_stripped) >= 50 and suffix_stripped != suffix:
-                if suffix_stripped in text[:-block_len]:
+
+    # =========================================================================
+    # PHASE 4: Sentence repetition (ONLY in very long outputs)
+    # =========================================================================
+    if len(text) >= 1200:
+        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+        if len(sentences) >= 8:
+            # Check last 8 sentences for near-total duplication
+            recent_sentences = sentences[-8:]
+            unique_count = len(set(recent_sentences))
+            # Only flag if almost all recent sentences are duplicates AND text is long
+            if unique_count <= 2 and len(text) >= 1200:
+                return True
+
+    # =========================================================================
+    # PHASE 5: Repeated blocks (verbatim repetition detection)
+    # =========================================================================
+    # This catches genuine infinite loops: same paragraph copied 2+ times.
+    # Uses two strategies:
+    #   A) Large blocks (400+ chars) — checks for 2+ repetitions of big paragraphs.
+    #   B) Small blocks (50-399 chars) — checks for 3+ repetitions (stronger signal).
+    if len(text) >= 1000:  # Only for very long outputs
+        # Strategy A: Large blocks (400+ chars) — 2 repetitions is enough
+        max_block = min(len(text) // 2, 800)
+        min_block = 400
+        if max_block >= min_block:
+            for block_len in range(max_block, min_block - 1, -50):
+                suffix = text[-block_len:]
+                earlier_pos = text[:-block_len].find(suffix)
+                if earlier_pos != -1:
+                    return True
+
+        # Strategy B: Small blocks (50-399 chars) — require 3+ repetitions
+        max_block_small = min(len(text) // 3, 399)
+        min_block_small = 50
+        if max_block_small >= min_block_small:
+            for block_len in range(max_block_small, min_block_small - 1, -25):
+                suffix = text[-block_len:]
+                # Count how many times suffix repeats consecutively at the end
+                count = 1
+                search_pos = len(text) - block_len
+                while search_pos >= block_len:
+                    if text[search_pos - block_len:search_pos] == suffix:
+                        count += 1
+                        search_pos -= block_len
+                    else:
+                        break
+                if count >= 3:
                     return True
 
     return False
@@ -387,7 +436,7 @@ def llm_stream(
     the_model=G_MODEL,
     max_reasoning_tokens: int | None = None,
     reasoning_only: bool = False,
-    max_stream_seconds: float = 120.0,
+    max_stream_seconds: float = 300.0,
     verbose: bool = True,
     max_retries: int = 3,
 ) -> Dict:
@@ -405,6 +454,7 @@ def llm_stream(
         loop = False
         cap = False
         first_chunk_time = None
+        _next_loop_check_at = {"reason": 400, "content": 400}
         try:
             stream = chat_with_ollama(
                 conv_local, model=the_model, stream=True,
@@ -436,9 +486,13 @@ def llm_stream(
                 reason += reasoning
                 if verbose:
                     print(reasoning, end="", flush=True)
-                if len(reason) > 200 and _detect_loop_in_text(reason):
-                    loop = True
-                    break
+                # Check loop detection periodically (every ~200 chars of growth)
+                # to avoid false positives from incremental chunk-by-chunk checking.
+                if len(reason) >= _next_loop_check_at["reason"]:
+                    if _detect_loop_in_text(reason):
+                        loop = True
+                        break
+                    _next_loop_check_at["reason"] = len(reason) + 200
             if content_piece:
                 if in_reasoning and content_piece:
                     if verbose:
@@ -447,9 +501,11 @@ def llm_stream(
                 content += content_piece
                 if verbose:
                     print(content_piece, end="", flush=True)
-                if len(content) > 200 and _detect_loop_in_text(content):
-                    loop = True
-                    break
+                if len(content) >= _next_loop_check_at["content"]:
+                    if _detect_loop_in_text(content):
+                        loop = True
+                        break
+                    _next_loop_check_at["content"] = len(content) + 200
             if (max_reasoning_tokens is not None
                     and in_reasoning
                     and (len(reason) / 3.245) >= max_reasoning_tokens):
