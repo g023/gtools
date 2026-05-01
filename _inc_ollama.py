@@ -192,7 +192,7 @@ def _shuffle_conversation(conv: List[Dict]):
 # ---------------------------------------------------------------------------
 # CORE OLLAMA (unchanged)
 # ---------------------------------------------------------------------------
-def ollama_get_models(host: str = None) -> List[str]:
+def ollama_get_models(host: str | None = None) -> List[str]:
     effective_host = _resolve_host(host)
     try:
         resp = requests.get(f"{effective_host}/api/tags", timeout=10)
@@ -202,14 +202,14 @@ def ollama_get_models(host: str = None) -> List[str]:
         print(f"Error fetching models from Ollama: {e}")
         return []
 
-def _resolve_host(host: Optional[str]) -> str:
+def _resolve_host(host: str | None) -> str:
     return (host or os.getenv("OLLAMA_HOST") or G_HOST).rstrip('/')
 
 def _parse_stream_line(raw_line: Union[bytes, str]) -> Optional[Union[Dict, object]]:
-    if isinstance(raw_line, bytes):
-        line = raw_line.decode('utf-8', errors='replace')
+    if isinstance(raw_line, (bytes, memoryview, bytearray)):
+        line: str = bytes(raw_line).decode('utf-8', errors='replace')
     else:
-        line = raw_line
+        line = str(raw_line)
     line = line.strip()
     if not line or line.startswith(':'):
         return None
@@ -240,12 +240,12 @@ def _is_reasoning_effort_unsupported_error(status_code: int, body: str) -> bool:
 def chat_with_ollama(
     messages: List[Dict[str, str]],
     model: str = G_MODEL,
-    host: str = None,
+    host: str | None = None,
     stream: bool = False,
-    reasoning_effort: Optional[str] = None,
+    reasoning_effort: str | None = None,
     options: Dict = G_OPTIONS,
     thinking: bool = G_THINKING,
-    request_timeout: Optional[float] = None,
+    request_timeout: float | None = None,
     **kwargs
 ) -> Union[Dict, Generator[Dict, None, None]]:
     if G_APPEND_PROMPT and messages and messages[-1].get("role") == "user":
@@ -315,14 +315,15 @@ def _stream_response(endpoint: str, headers: Dict, payload: Dict, timeout: float
                     continue
                 if chunk is _STREAM_DONE:
                     break
+                if not isinstance(chunk, dict):
+                    continue
                 yield chunk
-                if isinstance(chunk, dict):
-                    if chunk.get("done"):
+                if chunk.get("done"):
+                    break
+                if (choices := chunk.get("choices")):
+                    finish = choices[0].get("finish_reason")
+                    if finish in {"stop", "length", "content_filter"}:
                         break
-                    if (choices := chunk.get("choices")):
-                        finish = choices[0].get("finish_reason")
-                        if finish in {"stop", "length", "content_filter"}:
-                            break
     except requests.exceptions.ChunkedEncodingError as e:
         print(f"Stream encoding error (connection may have closed): {e}")
         raise ConnectionError("Stream connection terminated unexpectedly") from e
@@ -333,7 +334,9 @@ def _stream_response(endpoint: str, headers: Dict, payload: Dict, timeout: float
 # ---------------------------------------------------------------------------
 # NON‑STREAMING
 # ---------------------------------------------------------------------------
-def llm_nonstream(conv=[], thinking=True, options=G_OPTIONS, the_model=None):
+def llm_nonstream(conv=None, thinking=True, options=G_OPTIONS, the_model=None):
+    if conv is None:
+        conv = []
     ret = {"reasoning": "", "content": "", "usage": {}, "time_taken": 0}
     effective_model = the_model or G_MODEL
     print("\n--- (Non-Streaming) ---")
@@ -341,6 +344,7 @@ def llm_nonstream(conv=[], thinking=True, options=G_OPTIONS, the_model=None):
         t0 = time.time()
         resp = chat_with_ollama(conv, model=effective_model, reasoning_effort="medium",
                                 thinking=thinking, options=options)
+        assert isinstance(resp, dict), "Expected non-stream response"
         msg = resp['message']
         ret["time_taken"] = time.time() - t0
         ret["reasoning"] = msg.get('thinking', '')
@@ -359,23 +363,25 @@ def llm_nonstream(conv=[], thinking=True, options=G_OPTIONS, the_model=None):
 # INTELLIGENT STREAMING
 # ---------------------------------------------------------------------------
 def llm_stream(
-    conv=[],
+    conv=None,
     thinking=True,
     options=G_OPTIONS,
     retry_on_repeat=False,
     the_model=G_MODEL,
-    max_reasoning_tokens: Optional[int] = None,
+    max_reasoning_tokens: int | None = None,
     reasoning_only: bool = False,
     max_stream_seconds: float = 120.0,
     verbose: bool = True,
     max_retries: int = 3,
 ) -> Dict:
+    if conv is None:
+        conv = []
     conv = [msg.copy() for msg in conv]
     options = options.copy()
     options.setdefault("num_ctx", G_CONTEXT_WINDOW)
     options.setdefault("temperature", G_TEMP)
 
-    def _single_stream_attempt(conv_local, opts, think_enabled, deadline: Optional[float]):
+    def _single_stream_attempt(conv_local, opts, think_enabled, deadline: Optional[float], start_time: float):
         reason = ""
         content = ""
         in_reasoning = True
@@ -436,7 +442,7 @@ def llm_stream(
                 break
         if verbose:
             print()
-        ttft = (first_chunk_time - t_start) if first_chunk_time else None
+        ttft = (first_chunk_time - start_time) if first_chunk_time else None
         return reason, content, loop, cap, ttft
 
     reason = ""
@@ -453,7 +459,7 @@ def llm_stream(
                 print(f"\n[Retry {attempt}/{max_retries}] Temp={options['temperature']}")
 
         reason, content, loop, cap, ttft = _single_stream_attempt(
-            conv, options, thinking, deadline)
+            conv, options, thinking, deadline, t_start)
         if ttft_final is None:
             ttft_final = ttft
 
@@ -516,23 +522,51 @@ def llm_stream(
     return {"reasoning": reason, "content": content, "usage": usage, "time_taken": t}
 
 # ---------------------------------------------------------------------------
-# REASONING‑ONLY (multi‑round)
+# REASONING‑ONLY (multi‑round) — improved
 # ---------------------------------------------------------------------------
 def llm_reasoning_only(
-    conv=[],
+    conv=None,
     thinking=True,
     options=G_OPTIONS,
     the_model=G_MODEL,
     rounds: int = 1,
     verbose: bool = True,
+    context_summary: str = "",
     **kwargs
-) -> Union[str, List[str]]:
+) -> str | List[str]:
+    """
+    Multi-round reasoning-only extraction.
+
+    Each round runs llm_stream with reasoning_only=True, captures the
+    thinking/reasoning text, and feeds it back as context for the next round.
+
+    If `context_summary` is provided (caveman-style compressed context),
+    it is injected into the round>0 prompts instead of the generic
+    "Continue reasoning" message, enabling token-efficient context carryover.
+
+    Returns list of reasoning strings if rounds>1, else single string.
+    """
+    if conv is None:
+        conv = []
     conv = [msg.copy() for msg in conv]
     all_reasons = []
 
     for r in range(rounds):
         if r > 0:
-            conv.append({"role": "user", "content": "Continue reasoning based on the above."})
+            if context_summary:
+                # Use compressed context for token efficiency
+                prompt = (
+                    f"Prior context: {context_summary}\n"
+                    f"Continue reasoning. Build on prior findings. "
+                    f"Avoid repetition. Move toward definitive answer."
+                )
+            else:
+                prompt = "Continue reasoning based on the above."
+            conv.append({"role": "user", "content": prompt})
+
+        # Extract max_reasoning_tokens from kwargs if provided, else use None (no cap)
+        rt_kwargs = {k: v for k, v in kwargs.items() if k != "max_reasoning_tokens"}
+        max_rt = kwargs.get("max_reasoning_tokens", None)
         res = llm_stream(
             conv=conv,
             thinking=thinking,
@@ -541,11 +575,25 @@ def llm_reasoning_only(
             the_model=the_model,
             verbose=verbose,
             retry_on_repeat=False,
-            max_reasoning_tokens=None,
-            **kwargs,
+            max_reasoning_tokens=max_rt,
+            **rt_kwargs,
         )
         round_reasoning = res["reasoning"]
         all_reasons.append(round_reasoning)
+
+        # Detect loop across rounds — if reasoning barely changed, break
+        if r > 0 and round_reasoning:
+            prev = all_reasons[r - 1]
+            # Simple overlap check: if >80% of words same, likely looping
+            prev_words = set(prev.split())
+            curr_words = set(round_reasoning.split())
+            if prev_words and curr_words:
+                overlap = len(prev_words & curr_words) / max(len(prev_words | curr_words), 1)
+                if overlap > 0.8:
+                    if verbose:
+                        print(f"\n[Round {r+1}: >80% word overlap with previous — stopping early]")
+                    break
+
         conv.append({
             "role": "assistant",
             "content": "",
