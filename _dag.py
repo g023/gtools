@@ -1,20 +1,32 @@
 """
-DAG Related includes
+DAG Related includes with reasoning/actionable classification
 
 Author: g023 (https://github.com/g023)
 License: MIT
 """
 
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
+from enum import Enum
+
+class NodeCategory(Enum):
+    """Classification of node types for agent guidance"""
+    REASONING = "reasoning"      # Analysis, planning, research steps
+    ACTIONABLE = "actionable"    # Direct bash commands, file operations
+    VERIFICATION = "verification" # Check results, validate outcomes
+    DECISION = "decision"         # Branching points requiring user input
 
 @dataclass
 class DAGNode:
     id: str
     label: str
-    type: str  # action, decision, start, end
+    type: str  # action, decision, start, end (legacy compatibility)
+    category: NodeCategory  # New: reasoning vs actionable classification
+    expected_output: Optional[str] = None  # What this step should produce
+    dependencies: List[str] = field(default_factory=list)  # Files/data this step needs
+    produces: List[str] = field(default_factory=list)  # Files/data this step creates
 
 @dataclass
 class DAGEdge:
@@ -32,6 +44,22 @@ class ProcessedDAG:
     is_valid: bool = True
     validation_errors: List[str] = field(default_factory=list)
     topological_order: List[str] = field(default_factory=list)
+    
+    def get_nodes_by_category(self, category: NodeCategory) -> List[DAGNode]:
+        """Get all nodes of a specific category"""
+        return [node for node in self.nodes.values() if node.category == category]
+    
+    def get_reasoning_nodes(self) -> List[DAGNode]:
+        """Get all reasoning-type nodes"""
+        return self.get_nodes_by_category(NodeCategory.REASONING)
+    
+    def get_actionable_nodes(self) -> List[DAGNode]:
+        """Get all actionable nodes"""
+        return self.get_nodes_by_category(NodeCategory.ACTIONABLE)
+    
+    def get_verification_nodes(self) -> List[DAGNode]:
+        """Get all verification nodes"""
+        return self.get_nodes_by_category(NodeCategory.VERIFICATION)
 
 def process_dag_from_json(json_response: str) -> ProcessedDAG:
     """
@@ -58,8 +86,66 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
             cleaned = cleaned[:-3]
         return cleaned.strip()
     
+    def classify_node(node_id: str, label: str, node_type: str) -> NodeCategory:
+        """Intelligently classify node based on label and type"""
+        label_lower = label.lower()
+        
+        # Reasoning indicators
+        reasoning_keywords = ['analyze', 'research', 'plan', 'think', 'reason', 
+                              'consider', 'evaluate', 'assess', 'determine', 
+                              'check if', 'verify if', 'understand', 'review']
+        
+        # Actionable indicators  
+        actionable_keywords = ['create', 'write', 'build', 'implement', 'execute',
+                               'run', 'install', 'configure', 'edit', 'modify',
+                               'delete', 'move', 'copy', 'download', 'fetch']
+        
+        # Verification indicators
+        verification_keywords = ['validate', 'confirm', 'test', 'verify', 'ensure',
+                                 'check', 'assert', 'compare', 'diff']
+        
+        # Decision indicators
+        decision_keywords = ['decide', 'choose', 'select', 'branch', 'if', 'else']
+        
+        # Classification priority: decision > verification > reasoning > actionable
+        if any(kw in label_lower for kw in decision_keywords) or node_type == 'decision':
+            return NodeCategory.DECISION
+        elif any(kw in label_lower for kw in verification_keywords):
+            return NodeCategory.VERIFICATION
+        elif any(kw in label_lower for kw in reasoning_keywords):
+            return NodeCategory.REASONING
+        elif any(kw in label_lower for kw in actionable_keywords) or node_type == 'action':
+            return NodeCategory.ACTIONABLE
+        else:
+            # Default classification based on node type
+            if node_type == 'start':
+                return NodeCategory.REASONING
+            elif node_type == 'end':
+                return NodeCategory.VERIFICATION
+            else:
+                return NodeCategory.ACTIONABLE
+    
+    def infer_expected_output(label: str, category: NodeCategory) -> Optional[str]:
+        """Infer what output this step should produce"""
+        if category == NodeCategory.REASONING:
+            return "Analysis conclusion or decision"
+        elif category == NodeCategory.ACTIONABLE:
+            label_lower = label.lower()
+            if 'create' in label_lower or 'write' in label_lower:
+                return "New file or content created"
+            elif 'install' in label_lower:
+                return "Package installed"
+            elif 'configure' in label_lower:
+                return "Configuration updated"
+            else:
+                return "Command execution result"
+        elif category == NodeCategory.VERIFICATION:
+            return "Validation result (success/failure details)"
+        else:  # DECISION
+            return "Decision outcome with reasoning"
+    
     def validate_no_self_loops(edges: List[Dict], errors: List[str]) -> bool:
-        """Rule 7: No edge where from == to"""
+        """No edge where from == to"""
         valid = True
         for edge in edges:
             if edge['from'] == edge['to']:
@@ -68,7 +154,7 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
         return valid
     
     def validate_end_nodes_have_no_outgoing(edges: List[Dict], nodes: Dict[str, DAGNode], errors: List[str]) -> bool:
-        """Rule 6: End nodes must have NO outgoing edges"""
+        """End nodes must have NO outgoing edges"""
         end_node_ids = [node_id for node_id, node in nodes.items() if node.type == 'end']
         valid = True
         
@@ -87,10 +173,7 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
             errors.append("Topological order is missing or empty")
             return False
         
-        # Create position map
         position = {node_id: idx for idx, node_id in enumerate(topo_order)}
-        
-        # Check all node IDs in topo_order exist
         all_nodes_in_edges = set()
         for edge in edges:
             all_nodes_in_edges.add(edge['from'])
@@ -101,7 +184,6 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
             errors.append(f"Topological order missing nodes: {missing_nodes}")
             return False
         
-        # Check each edge respects order
         valid = True
         for edge in edges:
             if position[edge['from']] >= position[edge['to']]:
@@ -116,7 +198,6 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
     
     def validate_no_cycles(nodes: Dict[str, DAGNode], edges: List[DAGEdge], errors: List[str]) -> bool:
         """Detect cycles using DFS"""
-        # Build adjacency list
         graph = defaultdict(list)
         for edge in edges:
             graph[edge.from_node].append(edge.to_node)
@@ -157,12 +238,10 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
                             f"Allowed types: {allowed_types}")
                 valid = False
         
-        # Check at least one end node
         if not any(node.type == 'end' for node in nodes.values()):
             errors.append("No 'end' node found. At least one end node is required.")
             valid = False
         
-        # Check at most one start node (optional constraint)
         start_nodes = [node for node in nodes.values() if node.type == 'start']
         if len(start_nodes) > 1:
             errors.append(f"Multiple start nodes found: {len(start_nodes)}. Only one start node allowed.")
@@ -170,28 +249,11 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
         
         return valid
     
-    def validate_edge_conditions(edges: List[DAGEdge], errors: List[str]) -> bool:
-        """Validate condition field format"""
-        valid = True
-        
-        for i, edge in enumerate(edges):
-            # Condition should be either null/None or a non-empty string
-            if edge.condition is not None and not isinstance(edge.condition, str):
-                errors.append(f"Edge {edge.from_node} → {edge.to_node} has invalid condition type")
-                valid = False
-            elif edge.condition == "":
-                errors.append(f"Edge {edge.from_node} → {edge.to_node} has empty string condition. Use null instead.")
-                valid = False
-        
-        return valid
-    
     # Main processing
     try:
-        # Parse JSON
         cleaned = clean_json_response(json_response)
         data = json.loads(cleaned)
         
-        # Validate top-level structure
         if 'reasoning' not in data:
             raise ValueError("Missing 'reasoning' field in JSON")
         if 'dag' not in data:
@@ -202,15 +264,34 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
         if not all(key in dag_data for key in required_keys):
             raise ValueError(f"DAG missing required keys. Expected {required_keys}")
         
-        # Parse nodes
+        # Parse nodes with enhanced classification
         nodes = {}
         for node_data in dag_data['nodes']:
             if not all(k in node_data for k in ['id', 'label', 'type']):
                 raise ValueError(f"Node missing required fields: {node_data}")
+            
+            # Classify the node
+            category = classify_node(
+                node_data['id'], 
+                node_data['label'], 
+                node_data['type']
+            )
+            
+            # Infer expected output
+            expected_output = infer_expected_output(node_data['label'], category)
+            
+            # Get dependencies/produces if provided
+            dependencies = node_data.get('dependencies', [])
+            produces = node_data.get('produces', [])
+            
             nodes[node_data['id']] = DAGNode(
                 id=node_data['id'],
                 label=node_data['label'],
-                type=node_data['type']
+                type=node_data['type'],
+                category=category,
+                expected_output=expected_output,
+                dependencies=dependencies,
+                produces=produces
             )
         
         # Parse edges
@@ -225,41 +306,26 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
                 reason=edge_data.get('reason', '')
             ))
         
-        # Collect validation errors
+        # Validation
         validation_errors = []
-        
-        # Run all validations
         is_valid = True
         
-        # Rule 7: No self-loops
         if not validate_no_self_loops(dag_data['edges'], validation_errors):
             is_valid = False
         
-        # Rule 6: End nodes have no outgoing
         if not validate_end_nodes_have_no_outgoing(dag_data['edges'], nodes, validation_errors):
             is_valid = False
         
-        # Node type validation
         if not validate_node_types(nodes, validation_errors):
             is_valid = False
         
-        # Edge condition validation
-        if not validate_edge_conditions(edges, validation_errors):
-            is_valid = False
-        
-        # Cycle detection
         if not validate_no_cycles(nodes, edges, validation_errors):
             is_valid = False
         
-        # Topological order validation (if provided)
         topo_order = dag_data['metadata'].get('topological_order', [])
         if topo_order:
             if not validate_topological_order(dag_data['edges'], topo_order, validation_errors):
                 is_valid = False
-        
-        # Additional check: topological order matches metadata claim
-        if dag_data['metadata'].get('is_acyclic', False) and not is_valid:
-            validation_errors.append("Metadata claims graph is acyclic but validation found issues")
         
         return ProcessedDAG(
             reasoning=data['reasoning'],
@@ -277,29 +343,17 @@ def process_dag_from_json(json_response: str) -> ProcessedDAG:
         raise ValueError(f"Error processing DAG: {e}")
 
 def compute_topological_order(nodes: Dict[str, DAGNode], edges: List[DAGEdge]) -> List[str]:
-    """
-    Compute topological order using Kahn's algorithm if not provided.
-    
-    Returns:
-        List of node IDs in topological order
-        
-    Raises:
-        ValueError: If graph has cycles
-    """
-    # Build graph
+    """Compute topological order using Kahn's algorithm"""
     graph = defaultdict(list)
     in_degree = defaultdict(int)
     
-    # Initialize all nodes
     for node_id in nodes:
         in_degree[node_id] = 0
     
-    # Add edges
     for edge in edges:
         graph[edge.from_node].append(edge.to_node)
         in_degree[edge.to_node] += 1
     
-    # Kahn's algorithm
     queue = deque([node_id for node_id, degree in in_degree.items() if degree == 0])
     result = []
     
@@ -318,7 +372,7 @@ def compute_topological_order(nodes: Dict[str, DAGNode], edges: List[DAGEdge]) -
     return result
 
 def print_dag_summary(dag: ProcessedDAG):
-    """Print a human-readable summary of the DAG"""
+    """Print a human-readable summary of the DAG with categories"""
     print("=" * 60)
     print("DAG PROCESSING SUMMARY")
     print("=" * 60)
@@ -331,106 +385,43 @@ def print_dag_summary(dag: ProcessedDAG):
             print(f"  {i}. {error}")
         print()
     
+    # Print categorized nodes
     print(f"📊 Nodes ({len(dag.nodes)}):")
-    for node_id, node in dag.nodes.items():
-        outgoing = [e.to_node for e in dag.edges if e.from_node == node_id]
-        print(f"  • {node_id} [{node.type}]: {node.label}")
-        if outgoing:
-            print(f"    → {', '.join(outgoing)}")
+    reasoning_nodes = dag.get_reasoning_nodes()
+    actionable_nodes = dag.get_actionable_nodes()
+    verification_nodes = dag.get_verification_nodes()
+    
+    if reasoning_nodes:
+        print(f"\n  🧠 REASONING STEPS ({len(reasoning_nodes)}):")
+        for node in reasoning_nodes:
+            print(f"    • {node.id}: {node.label}")
+            if node.expected_output:
+                print(f"      Expected: {node.expected_output}")
+    
+    if actionable_nodes:
+        print(f"\n  ⚡ ACTIONABLE STEPS ({len(actionable_nodes)}):")
+        for node in actionable_nodes:
+            print(f"    • {node.id}: {node.label}")
+            if node.produces:
+                print(f"      Produces: {', '.join(node.produces)}")
+    
+    if verification_nodes:
+        print(f"\n  ✅ VERIFICATION STEPS ({len(verification_nodes)}):")
+        for node in verification_nodes:
+            print(f"    • {node.id}: {node.label}")
     
     print(f"\n🔗 Edges ({len(dag.edges)}):")
     for i, edge in enumerate(dag.edges, 1):
         condition_str = f" [{edge.condition}]" if edge.condition else ""
         print(f"  {i}. {edge.from_node} → {edge.to_node}{condition_str}")
-        if edge.reason:
-            print(f"     Reason: {edge.reason}")
     
     print(f"\n📈 Topological Order:")
     if dag.topological_order:
-        print(f"  {' → '.join(dag.topological_order)}")
-    else:
-        print("  Not provided (will compute if needed)")
+        order_with_categories = []
+        for node_id in dag.topological_order:
+            node = dag.nodes[node_id]
+            emoji = "🧠" if node.category == NodeCategory.REASONING else "⚡" if node.category == NodeCategory.ACTIONABLE else "✅"
+            order_with_categories.append(f"{emoji}{node_id}")
+        print(f"  {' → '.join(order_with_categories)}")
     
     print("=" * 60)
-
-# Example usage
-if __name__ == "__main__":
-    # The problematic JSON from before
-    problematic_json = '''
-    {
-      "reasoning": "The input statement has reversed order. Planning must come before design, and design must come before implementation. Correcting to: Planning → Design → Build → Testing → Deployment.",
-      "dag": {
-        "nodes": [
-          {"id": "planning", "label": "Planning", "type": "action"},
-          {"id": "design", "label": "Design", "type": "action"},
-          {"id": "build", "label": "Build", "type": "action"},
-          {"id": "testing", "label": "Testing", "type": "action"},
-          {"id": "deployment", "label": "Deployment", "type": "end"}
-        ],
-        "edges": [
-          {"from": "planning", "to": "design", "condition": null, "reason": "Planning must precede design"},
-          {"from": "design", "to": "build", "condition": null, "reason": "Design must precede build"},
-          {"from": "build", "to": "testing", "condition": null, "reason": "Implementation must precede testing"},
-          {"from": "testing", "to": "deployment", "condition": null, "reason": "Testing must precede deployment"},
-          {"from": "deployment", "to": "deployment", "condition": null, "reason": "Deployment is end"}
-        ],
-        "metadata": {
-          "is_acyclic": true,
-          "cycle_explanation": "Linear progression: Planning → Design → Build → Testing → Deployment",
-          "parallel_paths": [],
-          "topological_order": ["planning", "design", "build", "testing", "deployment"]
-        }
-      }
-    }
-    '''
-    
-    # Process the DAG
-    try:
-        dag = process_dag_from_json(problematic_json)
-        print_dag_summary(dag)
-        
-        # If valid, compute topological order if needed
-        if dag.is_valid and not dag.topological_order:
-            order = compute_topological_order(dag.nodes, dag.edges)
-            print(f"\n🔄 Computed Topological Order: {' → '.join(order)}")
-        
-    except ValueError as e:
-        print(f"❌ Error: {e}")
-        
-    print("\n" + "=" * 60)
-    print("EXAMPLE WITH CORRECTED JSON")
-    print("=" * 60)
-    
-    # Corrected JSON (without self-loop)
-    corrected_json = '''
-    {
-      "reasoning": "The input statement has reversed order. Planning must come before design, and design must come before implementation. Correcting to: Planning → Design → Build → Testing → Deployment.",
-      "dag": {
-        "nodes": [
-          {"id": "planning", "label": "Planning", "type": "action"},
-          {"id": "design", "label": "Design", "type": "action"},
-          {"id": "build", "label": "Build", "type": "action"},
-          {"id": "testing", "label": "Testing", "type": "action"},
-          {"id": "deployment", "label": "Deployment", "type": "end"}
-        ],
-        "edges": [
-          {"from": "planning", "to": "design", "condition": null, "reason": "Planning must precede design"},
-          {"from": "design", "to": "build", "condition": null, "reason": "Design must precede build"},
-          {"from": "build", "to": "testing", "condition": null, "reason": "Implementation must precede testing"},
-          {"from": "testing", "to": "deployment", "condition": null, "reason": "Testing must precede deployment"}
-        ],
-        "metadata": {
-          "is_acyclic": true,
-          "cycle_explanation": "Linear progression: Planning → Design → Build → Testing → Deployment",
-          "parallel_paths": [],
-          "topological_order": ["planning", "design", "build", "testing", "deployment"]
-        }
-      }
-    }
-    '''
-    
-    try:
-        corrected_dag = process_dag_from_json(corrected_json)
-        print_dag_summary(corrected_dag)
-    except ValueError as e:
-        print(f"❌ Error: {e}")
