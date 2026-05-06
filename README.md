@@ -1,5 +1,5 @@
 # g023's Local AI Agentic gTools
-Agentic Tool Library Powered by Local Models
+Agentic Tool Library Powered by Local Models (in this case a widdle tiny 1.77B baby model)
 
 Orchestrate the orchestrators.
 
