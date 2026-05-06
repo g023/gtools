@@ -1,7 +1,10 @@
-# Author: g023
-# License: MIT
+"""
+Handles the Ollama server API connection
 
-# creative ways to get a response from an ollama model that powers the underlying infra of https://github.com/g023/gtools/ as the interface to Ollama Server
+Author: g023
+License: MIT
+"""
+# creative ways to get a response from an ollama model
 
 import requests
 import json
@@ -29,7 +32,7 @@ G_THINKING = True        # set True for reasoning models
 
 G_CONTEXT_WINDOW = 40000
 G_MAX_OUTPUT_TOKENS = 16384
-G_TEMP = 1.0
+G_TEMP = 0.94
 G_REQUEST_TIMEOUT = 600  # seconds for standard requests
 G_STREAM_TIMEOUT = 600   # seconds for streaming requests
 
@@ -45,7 +48,7 @@ G_OPTIONS = {
     "presence_penalty": 0.5,
     "frequency_penalty": 1.0,
     "mirostat": 2,
-    "mirostat_tau": 0.8,
+    "mirostat_tau": 0.4,
     "mirostat_eta": 0.6,
     "penalize_newline": True,
     "numa": False,
