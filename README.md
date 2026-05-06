@@ -5,6 +5,12 @@ Orchestrate the orchestrators.
 
 **ALL AGENTIC TOOLS USE https://huggingface.co/g023/Qwen3-1.77B-g023-GGUF:Q8_0**
 
-Run directly:
-llm_bash_agent_simple.py
-llm_bash_agent_advanced.py
+<hr>
+
+**Demonstrations:**
+~~~
+python3 llm_bash_agent_simple.py 
+~~~
+~~~
+python3 llm_bash_agent_advanced.py 
+~~~
