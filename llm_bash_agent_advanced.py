@@ -1,109 +1,118 @@
 #!/usr/bin/env python3
 """
 Agentic CLI using bash as a tool, with user oversight for each command.
-Enhanced with automatic verification and content review.
-Uses only stock Python and the provided _inc_ollama, _json_fix, and _dag modules.
+The agent plans a DAG of actions and then executes them step by step.
+Uses only stock Python and the provided _inc_ollama, _json_fix, and example_dag modules.
+
+Enhanced with memory management and reasoning/actionable step classification.
+
+Author: g023 (https://github.com/g023)
+License: MIT
 """
 
 import sys
 import subprocess
 import re
-import os
+import json
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from collections import defaultdict
+
 from _inc_ollama import llm_stream
 from _json_fix import fix_json_string
-from _dag import process_dag_from_json, compute_topological_order
+from _dag import process_dag_from_json, compute_topological_order, NodeCategory, ProcessedDAG, DAGNode
 
+@dataclass
+class StepMemory:
+    """Local memory for a single step execution"""
+    step_id: str
+    step_label: str
+    category: NodeCategory
+    summary: str = ""
+    artifacts: List[str] = field(default_factory=list)  # Files created/modified
+    decisions: Dict[str, str] = field(default_factory=dict)  # Key decisions made
+    observations: List[str] = field(default_factory=list)  # Important observations
+    exit_status: Optional[int] = None
+    
+    def to_context_string(self) -> str:
+        """Convert memory to a compact context string for the LLM"""
+        parts = [f"Step: {self.step_label}"]
+        if self.summary:
+            parts.append(f"Summary: {self.summary}")
+        if self.artifacts:
+            parts.append(f"Created/Modified: {', '.join(self.artifacts)}")
+        if self.decisions:
+            decisions_str = ', '.join([f"{k}={v}" for k, v in self.decisions.items()])
+            parts.append(f"Decisions: {decisions_str}")
+        if self.observations:
+            # Only keep last 3 observations to avoid bloat
+            recent_obs = self.observations[-3:]
+            parts.append(f"Key observations: {'; '.join(recent_obs)}")
+        return " | ".join(parts)
 
-# ----------------------------------------------------------------------
-# Utility: detect what files a command touches (deduplicated)
-# ----------------------------------------------------------------------
-def detect_affected_files(command):
-    """
-    Heuristic to find filenames created or modified by a command.
-    Returns a dict: {filepath: 'created'|'appended'|'modified'}
-    """
-    files = {}
+@dataclass
+class ConversationMemory:
+    """Memory for the entire conversation, maintained locally"""
+    completed_steps: List[StepMemory] = field(default_factory=list)
+    current_step_id: str = ""
+    active_context: Dict[str, str] = field(default_factory=dict)  # For cross-step data
     
-    # cat >> file (append via heredoc)
-    for match in re.finditer(r'cat\s+>>\s*[\'\"]?([^\s;\'\"|&]+)[\'\"]?', command):
-        path = match.group(1)
-        if path and not path.startswith('/dev/'):
-            files[path] = 'appended'
+    def add_step_memory(self, memory: StepMemory):
+        """Add memory for a completed step"""
+        self.completed_steps.append(memory)
+        # Clean up old memories if too many (keep last 10)
+        if len(self.completed_steps) > 10:
+            # Summarize oldest steps into a compressed form
+            self._compress_old_memories()
     
-    # cat > file (overwrite via heredoc)
-    for match in re.finditer(r'cat\s+>\s*[\'\"]?([^\s;\'\"|&]+)[\'\"]?', command):
-        path = match.group(1)
-        if path and not path.startswith('/dev/') and path not in files:
-            files[path] = 'created'
+    def _compress_old_memories(self):
+        """Compress oldest memories to prevent context bloat"""
+        # Keep last 5 detailed, compress the rest
+        to_compress = self.completed_steps[:-5]
+        self.completed_steps = self.completed_steps[-5:]
+        
+        if to_compress:
+            compressed = "Previous steps completed: " + ", ".join([
+                f"{s.step_label} ({s.summary[:50] if s.summary else 'done'})" 
+                for s in to_compress
+            ])
+            self.active_context["compressed_history"] = compressed
     
-    # tee file or tee -a file
-    for match in re.finditer(r'tee\s+(-a\s+)?[\'\"]?([^\s;\'\"|&]+)[\'\"]?', command):
-        path = match.group(2)
-        if path and not path.startswith('/dev/') and path not in files:
-            files[path] = 'appended' if match.group(1) else 'created'
-    
-    # Redirects: > file (overwrite) or >> file (append)
-    for match in re.finditer(r'(?<!\<)\s*(>>?)\s*[\'\"]?([^\s;\'\"|&]+)[\'\"]?', command):
-        op, path = match.group(1), match.group(2)
-        if path and not path.startswith('/dev/') and path not in files:
-            files[path] = 'appended' if op == '>>' else 'created'
-    
-    # touch file1 file2 ...
-    touch_match = re.search(r'touch\s+(.+?)(?:\s*&&|\s*;|\s*\||$)', command)
-    if touch_match:
-        for f in re.findall(r'[\'\"]?([^\s;\'\"|&]+)[\'\"]?', touch_match.group(1)):
-            if f and not f.startswith('/dev/') and f not in files:
-                files[f] = 'modified'
-    
-    # mkdir dir
-    for match in re.finditer(r'mkdir\s+(?:-p\s+)?[\'\"]?([^\s;\'\"|&]+)[\'\"]?', command):
-        path = match.group(1)
-        if path and not path.startswith('/dev/') and path not in files:
-            files[path] = 'created'
-    
-    return files
-
-
-def generate_verify_command(filepath, operation):
-    """
-    Generate appropriate verification for a file.
-    Returns (verify_cmd, human_label) tuple.
-    """
-    ext = os.path.splitext(filepath)[1].lower()
-    
-    if ext == '.py':
-        return (
-            f"python3 -m py_compile {filepath} 2>&1 && echo 'SYNTAX_PASS' || echo 'SYNTAX_FAIL'",
-            "Python syntax check"
-        )
-    elif ext == '.sh':
-        return (
-            f"bash -n {filepath} 2>&1 && echo 'SYNTAX_PASS' || echo 'SYNTAX_FAIL'",
-            "Bash syntax check"
-        )
-    elif ext == '.json':
-        return (
-            f"python3 -c \"import json; json.load(open('{filepath}')); print('VALID_JSON')\" 2>&1 || echo 'INVALID_JSON'",
-            "JSON validation"
-        )
-    elif ext in ('.js', '.mjs'):
-        return (
-            f"node --check {filepath} 2>&1 && echo 'SYNTAX_PASS' || echo 'SYNTAX_FAIL'",
-            "JS syntax check"
-        )
-    else:
-        # For text files, check and preview content
-        return (
-            f"test -f {filepath} && wc -l < {filepath} | xargs echo 'LINES:' && echo '---PREVIEW---' && head -5 {filepath}",
-            "File content preview"
-        )
+    def get_context_for_step(self, current_step: DAGNode, max_history: int = 5) -> str:
+        """Get relevant context for the current step, limited to avoid bloat"""
+        context_parts = []
+        
+        # Include compressed history if present
+        if "compressed_history" in self.active_context:
+            context_parts.append(self.active_context["compressed_history"])
+        
+        # Include recent relevant steps (same category or producing needed artifacts)
+        relevant_steps = []
+        for mem in reversed(self.completed_steps[-max_history:]):
+            # Check if this step's artifacts are needed
+            if current_step.dependencies:
+                if any(dep in mem.artifacts for dep in current_step.dependencies):
+                    relevant_steps.append(mem)
+            # Or if same category for continuity
+            elif mem.category == current_step.category:
+                relevant_steps.append(mem)
+        
+        if relevant_steps:
+            context_parts.append("Recent relevant steps:")
+            for mem in relevant_steps[:3]:  # Limit to 3 most relevant
+                context_parts.append(f"  • {mem.to_context_string()}")
+        
+        return "\n".join(context_parts) if context_parts else ""
 
 
 # ----------------------------------------------------------------------
 # DAG planning from the user goal
 # ----------------------------------------------------------------------
-def generate_dag(goal):
-    """Ask the LLM to produce a DAG for the given goal."""
+def generate_dag(goal: str) -> Tuple[ProcessedDAG, List[str]]:
+    """
+    Ask the LLM to produce a DAG for the given goal.
+    Returns (ProcessedDAG, topological_order_list).
+    """
     system_prompt = (
         "You are an advanced system algorithm. "
         "Give answers with no fluff, and no introduction."
@@ -115,22 +124,34 @@ def generate_dag(goal):
 {goal}
 === /input_statement ===
 
-Deconstruct this statement into a Directed Acyclic Graph (DAG).
+Deconstruct this statement into an actionable Directed Acyclic Graph (DAG) for an agentic LLM to finish the goal outlined in the input_statement.
 
-## STEP 1: REASON ABOUT ORDERING
-Before outputting JSON, reason through these questions:
-1. What is the correct temporal or logical sequence of actions?
-2. Are there any reversed dependencies that violate real-world logic?
-3. Identify the true start node (no incoming edges) and end node (no outgoing edges).
+## STEP 1: REASON ABOUT ORDERING AND CATEGORIZATION
+Before outputting JSON, classify each step:
+- **Reasoning steps**: Steps that require analysis, research, planning, or thinking
+- **Actionable steps**: Steps that execute commands, create/modify files, install software
+- **Verification steps**: Steps that check results, validate outcomes, ensure correctness
+- **Decision steps**: Steps that require choosing between alternatives
+
+For each step, identify:
+- What files or data it depends on (dependencies)
+- What files or data it produces (produces)
+- What output is expected
 
 ## STEP 2: OUTPUT JSON
-Return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object with the following exact structure:
 
 {{
-  "reasoning": "Brief explanation of the logical order",
+  "reasoning": "Brief explanation of the logical order and why edges are correct",
   "dag": {{
     "nodes": [
-      {{"id": "string", "label": "string", "type": "action|decision|start|end"}}
+      {{
+        "id": "string", 
+        "label": "string", 
+        "type": "action|decision|start|end",
+        "dependencies": ["file1", "data2"],  // What this step needs
+        "produces": ["output.txt", "result.json"]  // What this step creates
+      }}
     ],
     "edges": [
       {{"from": "string", "to": "string", "condition": null, "reason": "string"}}
@@ -144,11 +165,12 @@ Return ONLY a valid JSON object with this exact structure:
   }}
 }}
 
-CRITICAL RULES:
-1. The start node is a marker only — put NO real work in it. First action node does actual work.
-2. The end node MUST have NO outgoing edges and be LAST in topological_order.
-3. No self-loops (from == to).
-4. Only action nodes contain real work. start/end are structural.
+## CRITICAL RULES:
+1. **End node rule**: A node with type="end" MUST have NO outgoing edges.
+2. **Self-loop rule**: No edge where from == to.
+3. **Single end node**: Use exactly ONE node with type="end".
+4. **Dependencies**: For actionable steps, list files/artifacts they need as dependencies.
+5. **Produces**: For steps that create outputs, list what they produce.
 
 Now process the input statement and return ONLY the JSON.
 """
@@ -161,6 +183,7 @@ Now process the input statement and return ONLY the JSON.
     res = llm_stream(conv, thinking=True, max_reasoning_tokens=40, verbose=True)
     raw = res["content"]
 
+    # Fix common JSON issues before parsing
     try:
         fixed = fix_json_string(raw)
     except Exception as e:
@@ -169,6 +192,7 @@ Now process the input statement and return ONLY the JSON.
 
     dag = process_dag_from_json(fixed)
 
+    # Make sure we have a topological order
     if not dag.topological_order:
         order = compute_topological_order(dag.nodes, dag.edges)
     else:
@@ -178,232 +202,232 @@ Now process the input statement and return ONLY the JSON.
 
 
 # ----------------------------------------------------------------------
-# Snapshot project files for context
+# Helper: Create memory from step execution
 # ----------------------------------------------------------------------
-def get_file_inventory():
-    """Return a summary of relevant files in the current directory."""
-    lines = []
-    for root, dirs, files in os.walk('.'):
-        # Skip hidden dirs and common non-project dirs
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('__pycache__', 'node_modules', 'venv')]
-        for f in files:
-            if f.startswith('.'):
-                continue
-            path = os.path.join(root, f)
-            try:
-                size = os.path.getsize(path)
-                lines.append(f"  {path} ({size} bytes)")
-            except:
-                pass
-    if not lines:
-        return "(no files yet)"
-    return "\n".join(lines[:20])  # Limit to 20 files
+def create_step_memory(
+    step_node: DAGNode, 
+    summary: str = "", 
+    artifacts: List[str] = None,
+    decisions: Dict[str, str] = None,
+    observations: List[str] = None,
+    exit_status: Optional[int] = None
+) -> StepMemory:
+    """Create a memory object for a completed step"""
+    return StepMemory(
+        step_id=step_node.id,
+        step_label=step_node.label,
+        category=step_node.category,
+        summary=summary,
+        artifacts=artifacts or [],
+        decisions=decisions or {},
+        observations=observations or [],
+        exit_status=exit_status
+    )
 
 
 # ----------------------------------------------------------------------
-# Verification loop
+# Agent loop for a single DAG node (sub‑task)
 # ----------------------------------------------------------------------
-def run_verification_loop(cmd, conv, goal, task_label):
+def execute_agent_for_task(
+    goal: str, 
+    task_node: DAGNode, 
+    memory: ConversationMemory,
+    previous_outputs: Dict[str, str] = None
+) -> StepMemory:
     """
-    After a command executes, detect affected files and verify them.
-    For text files, show content preview so user can judge quality.
+    Run an interactive agent loop for one high‑level task.
+    The agent proposes bash commands; the user must approve each one.
+    Returns StepMemory with execution summary.
     """
-    affected = detect_affected_files(cmd)
+    print(f"\n🤖 Working on: {task_node.label}")
+    print(f"   Category: {task_node.category.value}")
+    if task_node.dependencies:
+        print(f"   Depends on: {', '.join(task_node.dependencies)}")
+    if task_node.produces:
+        print(f"   Produces: {', '.join(task_node.produces)}")
+
+    # Build context-aware system prompt
+    category_instructions = {
+        NodeCategory.REASONING: """
+This is a REASONING step. Your goal is to analyze, plan, or research.
+You should:
+- Focus on thinking through the problem
+- Use commands like `ls`, `cat`, `find`, `grep` to inspect the environment
+- Avoid creating or modifying files unless absolutely necessary
+- Output your conclusions clearly for later steps
+""",
+        NodeCategory.ACTIONABLE: """
+This is an ACTIONABLE step. Your goal is to execute commands that change the system.
+You should:
+- Create, modify, or delete files as needed
+- Install packages, configure systems, run builds
+- Use heredoc (<< 'EOF' ... EOF) for multiline content
+- Avoid using 'echo' - prefer printf or cat with heredoc
+""",
+        NodeCategory.VERIFICATION: """
+This is a VERIFICATION step. Your goal is to check that previous steps worked correctly.
+You should:
+- Use commands like `diff`, `test`, `grep -q` to validate
+- Compare outputs to expected results
+- Clearly state whether verification passed or failed
+""",
+        NodeCategory.DECISION: """
+This is a DECISION step. Your goal is to choose between alternatives.
+You should:
+- Examine the current state using inspection commands
+- Present options with pros/cons
+- Ask the user for input if needed
+- Document the decision made
+"""
+    }
+
+    # Get relevant context from memory
+    context_str = memory.get_context_for_step(task_node)
     
-    if not affected:
-        return True
-    
-    print(f"\n🔍 Verifying {len(affected)} file(s)...")
-    
-    for filepath, operation in affected.items():
-        if not os.path.exists(filepath):
-            print(f"  ⚠️  Expected file not found: {filepath}")
-            continue
+    # Get previous outputs that might be relevant
+    deps_context = ""
+    if previous_outputs and task_node.dependencies:
+        relevant_outputs = {k: v for k, v in previous_outputs.items() 
+                           if any(dep in k for dep in task_node.dependencies)}
+        if relevant_outputs:
+            deps_context = "\n\nOutputs from previous steps you should use:\n"
+            for key, value in list(relevant_outputs.items())[:3]:  # Limit to 3
+                deps_context += f"  {key}: {value[:200]}\n"
+
+    system_prompt = (
+        "You are an autonomous agent with access to a bash shell. "
+        "You will be given a task and must accomplish it by issuing NON-BLOCKING bash commands "
+        "one at a time. For each step, output your reasoning, then provide the exact "
+        "bash command to execute. "
+        "\n\n"
+        "IMPORTANT FOR MULTILINE COMMANDS: "
+        "For commands spanning multiple lines, use bash heredoc syntax:\n"
+        "  cat > file.txt << 'EOF'\n"
+        "  line 1 content\n"
+        "  line 2 content\n"
+        "  line 3 content\n"
+        "  EOF\n"
+        "\n"
+        "CRITICAL: The closing delimiter (EOF, END, etc.) MUST be on its own line "
+        "with no leading or trailing spaces. Do not indent the closing delimiter.\n\n"
+        "Start your response with 'RATIONALE:' followed by your reasoning. "
+        "Then write 'COMMAND:' and on the following lines, write the full command. "
+        "After the command, write 'END_COMMAND' on its own line. "
+        "You can use multiple commands if needed, but only one per turn. "
+        "After receiving the result of the command, you may ask for another. "
+        "When the task is complete, output 'DONE' on its own line. "
+        "If you need to view the current directory or files, use ls, pwd, etc. Local Python is Python3. "
+        "Avoid using 'echo' - prefer printf, cat with heredoc, or direct file writing. "
+        "FORBIDDEN: 'nano' and other blocking applications. "
+        "Check before installing new things. "
+
+        "VERIFICATION COMMANDS GUIDE:\n"
+        "  ✓ Check file has content: `[ -s filename ] && echo 'HAS_CONTENT' || echo 'EMPTY'`\n"
+        "  ✓ Count lines: `wc -l filename`\n"
+        "  ✓ Preview content: `head -5 filename`\n"
+        "  ✓ Check specific text: `grep -q 'pattern' filename && echo 'MATCH'`\n"
+        "  ✗ AVOID: `test -f` (only checks existence, not content)\n"
+        "  ✗ AVOID: commands that produce no output on success\n"
+        "  IMPORTANT: Always use commands that give you actionable information!\n"
+        "\n"
         
-        verify_cmd, label = generate_verify_command(filepath, operation)
-        print(f"  📄 {filepath} [{operation}] — {label}")
-        
-        try:
-            proc = subprocess.run(
-                verify_cmd, shell=True, capture_output=True, text=True,
-                timeout=15, executable='/bin/bash'
-            )
-            output = (proc.stdout + proc.stderr).strip()
-            
-            print(f"  {'✅' if proc.returncode == 0 else '❌'} {label}:")
-            # Print each line of output indented
-            for line in output.split('\n')[:8]:
-                print(f"     {line}")
-            
-            if proc.returncode != 0:
-                # Feed failure back to agent
-                try:
-                    with open(filepath, 'r') as f:
-                        content = f.read()
-                    preview = content[:500]
-                    if len(content) > 500:
-                        preview += "\n... (truncated)"
-                except:
-                    preview = "(could not read file)"
-                
-                conv.append({
-                    "role": "user",
-                    "content": (
-                        f"⚠️  Verification FAILED for {filepath}\n"
-                        f"Error: {output[:300]}\n\n"
-                        f"Current file content:\n{preview}\n\n"
-                        f"Provide a CORRECTED command to fix this file."
-                    )
-                })
-                
-                # Retry loop
-                for attempt in range(3):
-                    print(f"\n  🔧 Asking agent for fix (attempt {attempt+1}/3)...")
-                    res = llm_stream(conv, thinking=True, verbose=False)
-                    fix_content = res["content"]
-                    conv.append({"role": "assistant", "content": fix_content})
-                    
-                    fix_cmd = extract_command(fix_content)
-                    if not fix_cmd:
-                        print("  ⚠️  No command found in response")
-                        break
-                    
-                    print(f"  💡 Agent proposes: {fix_cmd[:120]}...")
-                    choice = input("  Apply fix? (y/n/e): ").strip().lower()
-                    if choice == 'n':
-                        break
-                    elif choice == 'e':
-                        fix_cmd = input("  Enter corrected command: ").strip()
-                    
-                    try:
-                        subprocess.run(
-                            fix_cmd, shell=True, capture_output=True, text=True,
-                            timeout=30, executable='/bin/bash'
-                        )
-                        # Re-verify
-                        vproc = subprocess.run(
-                            verify_cmd, shell=True, capture_output=True, text=True,
-                            timeout=15, executable='/bin/bash'
-                        )
-                        if vproc.returncode == 0:
-                            print(f"  ✅ Fixed successfully")
-                            break
-                        print(f"  ❌ Still failing: {vproc.stderr[:200]}")
-                        conv.append({
-                            "role": "user",
-                            "content": f"Fix attempt {attempt+1} failed. Error:\n{vproc.stderr[:300]}"
-                        })
-                    except Exception as e:
-                        print(f"  ❌ Error: {e}")
-                        break
-        
-        except subprocess.TimeoutExpired:
-            print(f"  ⚠️  Verification timed out")
-        except Exception as e:
-            print(f"  ⚠️  Error: {e}")
-    
-    return True
+        "Be safe and avoid destructive commands without confirmation."
+        + category_instructions.get(task_node.category, "")
+        + """
+==desired_format==
 
+RATIONALE:
+Your reasoning here.
 
-def extract_command(content):
-    """Extract a bash command from agent response."""
-    # Multiline COMMAND ... END_COMMAND
-    match = re.search(r"COMMAND:\s*\n(.*?)\nEND_COMMAND", content, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    # Single line variations
-    match = re.search(r"COMMAND:\s*(.*?)\nEND_COMMAND", content, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    
-    match = re.search(r"^COMMAND:\s*(.*?)$", content, re.MULTILINE)
-    if match:
-        return match.group(1).strip()
-    
-    return None
+COMMAND:
+cat > file.txt << 'EOF'
+line 1 content
+line 2 content
+line 3 content
+EOF
 
+END_COMMAND
 
-# ----------------------------------------------------------------------
-# Agent loop for a single DAG node
-# ----------------------------------------------------------------------
-def execute_agent_for_task(goal, task_label, file_context=""):
-    """
-    Run interactive agent loop for one task.
-    After each command, auto-verify affected files.
-    """
-    print(f"\n🤖 Working on: {task_label}")
+==/desired_format==
+"""
+    )
+
+    user_prompt = (
+        f"Overall goal: {goal}\n"
+        f"Current subtask: {task_node.label}\n"
+        f"Expected output: {task_node.expected_output or 'Not specified'}\n"
+        f"Category: {task_node.category.value}\n"
+        f"{deps_context}\n"
+        f"{context_str}\n\n"
+        "Start by assessing the situation and suggesting the first command.\n"
+        "Remember: Use heredoc (<< 'EOF' ... EOF) for multiline content, avoid using 'echo'.\n"
+        "IMPORTANT: Always end your command with 'END_COMMAND' on a new line.\n"
+        "When complete, output 'DONE'."
+    )
 
     conv = [
-        {
-            "role": "system",
-            "content": (
-                "You are an autonomous agent with access to a bash shell. "
-                "You will be given a task and must accomplish it by issuing NON-BLOCKING bash commands "
-                "one at a time. For each step, output your reasoning, then provide the exact "
-                "bash command to execute.\n\n"
-                "CRITICAL FILE OPERATIONS:\n"
-                "- Use 'cat > file << EOF' to CREATE/OVERWRITE a file\n"
-                "- Use 'cat >> file << EOF' to APPEND to an existing file\n"
-                "- Use 'cat file' to READ and check what's already there\n"
-                "- Before modifying a file, READ it first to know its current contents\n\n"
-                "IMPORTANT FOR MULTILINE COMMANDS:\n"
-                "Use bash heredoc syntax:\n"
-                "  cat > file.txt << 'EOF'\n"
-                "  content here\n"
-                "  EOF\n\n"
-                "The closing delimiter MUST be on its own line with no spaces.\n\n"
-                "Start with 'RATIONALE:' then 'COMMAND:' then the command, then 'END_COMMAND' on its own line.\n"
-                "When task is complete, output 'DONE' on its own line.\n\n"
-                "FORBIDDEN: nano, vim, and other blocking applications.\n"
-                "Local Python is Python3. Avoid 'echo' for multiline content."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Overall goal: {goal}\n"
-                f"Current subtask: {task_label}\n"
-                f"{file_context}\n"
-                "Start by assessing the situation. If files already exist, read them first.\n"
-                "Use heredoc (<< 'EOF' ... EOF) for multiline content.\n"
-                "End each command with 'END_COMMAND' on a new line."
-            ),
-        },
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
     ]
 
     done = False
+    step_observations = []
+    step_artifacts = []
+    step_decisions = {}
+    last_summary = ""
+
     while not done:
+        # Get the agent's next message
         res = llm_stream(conv, thinking=True, verbose=False)
         content = res["content"]
         conv.append({"role": "assistant", "content": content})
-        print("\n" + "─" * 50)
-        
-        # Show shorter preview of agent response
-        preview = content[:400]
-        if len(content) > 400:
-            preview += f"\n... ({len(content)} chars total)"
-        print("Agent:", preview)
+        print("Agent:", content)
 
+        # Check for completion marker
         if re.search(r"\bDONE\b", content):
             print("✅ Subtask marked as completed.")
             done = True
             break
 
-        cmd = extract_command(content)
+        # Extract command (same patterns as before)
+        cmd = None
+        
+        pattern1 = r"COMMAND:\s*\n(.*?)\nEND_COMMAND"
+        match1 = re.search(pattern1, content, re.DOTALL | re.MULTILINE)
+        if match1:
+            cmd = match1.group(1).strip()
+        
+        if not cmd:
+            pattern2 = r"COMMAND:\s*(.*?)\nEND_COMMAND"
+            match2 = re.search(pattern2, content, re.DOTALL | re.MULTILINE)
+            if match2:
+                cmd = match2.group(1).strip()
+        
+        if not cmd:
+            pattern3 = r"COMMAND:\s*\n(.*?)(?=\n\n|$)"
+            match3 = re.search(pattern3, content, re.DOTALL | re.MULTILINE)
+            if match3:
+                cmd = match3.group(1).strip()
+                print("⚠️  Note: Command missing 'END_COMMAND' marker")
+        
+        if not cmd:
+            single_line_match = re.search(r"^COMMAND:\s*(.*?)$", content, re.MULTILINE)
+            if single_line_match:
+                cmd = single_line_match.group(1).strip()
         
         if not cmd:
             print("No command found in agent's response.")
-            action = input("Continue? (y/n/e): ").strip().lower()
+            action = input("Continue? (y/n/e to edit response): ").strip().lower()
             if action == "n":
                 done = True
                 break
             elif action == "e":
-                print("Enter command (Ctrl+D when done):")
+                print("Enter the correct command (multiple lines allowed, press Ctrl+D or Ctrl+Z then Enter when done):")
                 lines = []
                 try:
                     while True:
-                        lines.append(input())
+                        line = input()
+                        lines.append(line)
                 except EOFError:
                     pass
                 cmd = "\n".join(lines).strip()
@@ -412,43 +436,48 @@ def execute_agent_for_task(goal, task_label, file_context=""):
             else:
                 conv.append({
                     "role": "user",
-                    "content": "Please provide the command with 'COMMAND:' followed by 'END_COMMAND'."
+                    "content": "Please provide the command with 'COMMAND:' followed by the command and then 'END_COMMAND' on a new line."
                 })
                 continue
         
-        # Warn on overwrite vs append
-        if re.search(r'cat\s+>\s+', cmd) and not re.search(r'>>', cmd):
-            existing_file = re.search(r'cat\s+>\s*[\'\"]?([^\s;\'\"|&]+)[\'\"]?', cmd)
-            if existing_file and os.path.exists(existing_file.group(1)):
-                print(f"⚠️  WARNING: This will OVERWRITE existing file '{existing_file.group(1)}'")
-                print("   Use 'cat >> file << EOF' to APPEND instead.")
-        
-        # Show command and get approval
-        reasoning_match = re.search(r'RATIONALE:\s*(.*?)(?:COMMAND:|$)', content, re.DOTALL)
-        reasoning = reasoning_match.group(1).strip() if reasoning_match else "(No reasoning)"
-        
-        print(f"\n💡 {reasoning[:200]}")
-        print(f"⚡ Command:\n{cmd[:300]}{'...' if len(cmd) > 300 else ''}")
+        # Extract reasoning
+        reasoning = content.split("COMMAND:")[0].strip()
+        reasoning = re.sub(r'^RATIONALE:\s*', '', reasoning, flags=re.MULTILINE)
+        if not reasoning:
+            reasoning = "(No reasoning provided)"
+
+        # Show the user what will be executed
+        print(f"\n💡 Reasoning: {reasoning}")
+        print(f"⚡ Proposed command:\n{cmd}")
 
         approved = False
         while True:
-            choice = input("\nExecute? (y)es/(n)o/(e)dit/(r)ead-first/(s)kip/(q)uit: ").strip().lower()
-            
+            choice = (
+                input("\nExecute? (y)es / (n)o / (e)dit / (s)kip / (q)uit: ")
+                .strip()
+                .lower()
+            )
+
             if choice in ("y", "yes"):
                 approved = True
                 break
+
             elif choice in ("n", "no"):
-                conv.append({
-                    "role": "user",
-                    "content": "Command rejected. Suggest alternative."
-                })
+                conv.append(
+                    {
+                        "role": "user",
+                        "content": "Command rejected. Please suggest an alternative command."
+                    }
+                )
                 break
+
             elif choice in ("e", "edit"):
-                print("Enter new command (Ctrl+D when done):")
+                print("Enter the new command (multiple lines allowed, press Ctrl+D or Ctrl+Z then Enter when done):")
                 lines = []
                 try:
                     while True:
-                        lines.append(input())
+                        line = input()
+                        lines.append(line)
                 except EOFError:
                     pass
                 new_cmd = "\n".join(lines).strip()
@@ -456,36 +485,32 @@ def execute_agent_for_task(goal, task_label, file_context=""):
                     cmd = new_cmd
                     approved = True
                     break
-            elif choice == "r":
-                # Read the target file first
-                target = re.search(r'(?:cat\s+[>>]?\s*|>+\s*)[\'\"]?([^\s;\'\"|&]+)[\'\"]?', cmd)
-                if target and os.path.exists(target.group(1)):
-                    with open(target.group(1), 'r') as f:
-                        content = f.read()
-                    print(f"\n📖 Current content of {target.group(1)}:")
-                    print(content[:500])
-                    print(f"... ({len(content)} chars total)" if len(content) > 500 else "")
-                    conv.append({
-                        "role": "user",
-                        "content": f"Current content of {target.group(1)}:\n{content[:1000]}"
-                    })
                 else:
-                    print("📖 File doesn't exist yet — safe to create")
-                continue  # Back to approval
+                    print("Empty command. Try again.")
+
             elif choice in ("s", "skip"):
-                conv.append({"role": "user", "content": "Skip this command."})
+                conv.append(
+                    {
+                        "role": "user",
+                        "content": "Skip this command and consider the subtask completed."
+                    }
+                )
                 done = True
                 break
+
             elif choice in ("q", "quit"):
                 sys.exit(0)
-        
+
+            else:
+                print("Invalid choice.")
+
         if not approved and not done:
             continue
         if done:
             break
 
-        # Execute
-        print(f"\n🚀 Running...")
+        # Execute the approved command
+        print(f"Running command...")
         try:
             proc = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=30, executable='/bin/bash'
@@ -496,20 +521,52 @@ def execute_agent_for_task(goal, task_label, file_context=""):
         except Exception as e:
             stdout, stderr, rc = "", str(e), -1
 
+        # Build result message
         result_msg = f"Exit code: {rc}\n"
         if stdout:
-            result_msg += f"STDOUT:\n{stdout[:500]}\n"
+            result_msg += f"STDOUT:\n{stdout}\n"
         if stderr:
-            result_msg += f"STDERR:\n{stderr[:500]}\n"
+            result_msg += f"STDERR:\n{stderr}\n"
         if not stdout and not stderr:
             result_msg += "(no output)"
 
         conv.append({"role": "user", "content": f"Command result:\n{result_msg}"})
-        print("📋 " + result_msg[:200])
+        print("📋 Output:\n" + result_msg)
+        
+        # Extract observations and artifacts from output
+        if stdout:
+            step_observations.append(stdout[:200])  # Store truncated observation
+        
+        # Try to detect created files from the command
+        file_patterns = [r'cat > ([^\s]+)', r'printf.*> ([^\s]+)', r'cp ([^\s]+) ([^\s]+)']
+        for pattern in file_patterns:
+            matches = re.findall(pattern, cmd)
+            for match in matches:
+                if isinstance(match, tuple):
+                    step_artifacts.extend([f for f in match if f.endswith(('.txt', '.json', '.py', '.md', '.log'))])
+                else:
+                    if match.endswith(('.txt', '.json', '.py', '.md', '.log')):
+                        step_artifacts.append(match)
+        step_artifacts = list(set(step_artifacts))[:5]  # Keep unique, max 5
 
-        # Auto-verify if command succeeded
-        if rc == 0:
-            run_verification_loop(cmd, conv, goal, task_label)
+    # After completion, ask for summary
+    summary = input("What was achieved? (one sentence summary): ").strip()
+    if not summary:
+        summary = f"Completed {task_node.label}"
+    
+    # Ask for any key decisions made
+    if task_node.category == NodeCategory.DECISION:
+        decision = input("What decision was made? (press Enter to skip): ").strip()
+        if decision:
+            step_decisions["decision"] = decision
+    
+    return create_step_memory(
+        step_node=task_node,
+        summary=summary,
+        artifacts=step_artifacts,
+        decisions=step_decisions,
+        observations=step_observations[:5]  # Keep last 5 observations
+    )
 
 
 # ----------------------------------------------------------------------
@@ -524,43 +581,48 @@ def main():
     print("🧠 Generating plan …")
     try:
         dag, order = generate_dag(goal)
+        print("\n✅ Plan generated. Topological order:")
         
-        # Filter out start and end nodes for execution
-        actionable_order = [
-            nid for nid in order 
-            if dag.nodes[nid].type not in ('start', 'end')
-        ]
+        # Show categorized order
+        for i, node_id in enumerate(order, 1):
+            node = dag.nodes[node_id]
+            emoji = "🧠" if node.category == NodeCategory.REASONING else "⚡" if node.category == NodeCategory.ACTIONABLE else "✅" if node.category == NodeCategory.VERIFICATION else "🤔"
+            print(f"  {i}. {emoji} {node.label} ({node.category.value})")
         
-        print("\n✅ Plan generated.")
-        print(f"   All nodes: {' → '.join(order)}")
-        if actionable_order:
-            print(f"   Actionable: {' → '.join(actionable_order)}")
-        else:
-            print("   (all nodes are structural — nothing to execute)")
-            return
-
-        context = []
-
-        for i, node_id in enumerate(actionable_order, 1):
+        # Initialize memory
+        memory = ConversationMemory()
+        previous_outputs = {}  # For tracking outputs between steps
+        
+        # Execute each node in order
+        for i, node_id in enumerate(order, 1):
             node = dag.nodes[node_id]
             print(f"\n{'='*60}")
-            print(f"--- Step {i}/{len(actionable_order)}: {node.label} ---")
+            print(f"Step {i}/{len(order)}: {node.label}")
+            print(f"Category: {node.category.value.upper()}")
             print(f"{'='*60}")
+            
+            # For reasoning steps, we can provide a different prompt
+            if node.category == NodeCategory.REASONING:
+                print("💭 This is a reasoning step - focus on analysis and planning")
+            
+            step_memory = execute_agent_for_task(goal, node, memory, previous_outputs)
+            memory.add_step_memory(step_memory)
+            
+            # Store outputs for dependency resolution
+            if step_memory.artifacts:
+                for artifact in step_memory.artifacts:
+                    previous_outputs[artifact] = step_memory.summary
+            if step_memory.summary:
+                previous_outputs[node.id] = step_memory.summary
+            
+            print(f"✅ Step completed: {step_memory.summary}")
 
-            # Build context with file inventory
-            file_context = "Current project files:\n" + get_file_inventory()
-            if context:
-                file_context += "\n\nPreviously completed:\n" + "\n".join(context)
-
-            execute_agent_for_task(goal, node.label, file_context)
-
-            summary = input("\nWhat was achieved? (Enter to skip): ").strip()
-            if summary:
-                context.append(f"✅ {node.label}: {summary}")
-            else:
-                context.append(f"✅ {node.label}: done.")
-
-        print("\n🎉 Goal completed.")
+        print("\n🎉 Goal completed successfully!")
+        
+        # Print final memory summary
+        print("\n📝 Execution Summary:")
+        for mem in memory.completed_steps:
+            print(f"  • {mem.step_label}: {mem.summary[:80]}")
 
     except Exception as e:
         print(f"❌ Error: {e}")
