@@ -14,3 +14,6 @@ python3 llm_bash_agent_simple.py
 ~~~
 python3 llm_bash_agent_advanced.py 
 ~~~
+~~~
+python3 llm_judge_test.py 
+~~~
