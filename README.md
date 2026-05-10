@@ -24,3 +24,6 @@ python3 llm_bash_agent_advanced.py
 ~~~
 python3 llm_judge_test.py 
 ~~~
+~~~
+python3 llm_react_agent.py 
+~~~
