@@ -72,8 +72,31 @@ class ReActAgent:
     def thought(self, question: str, observations_so_far: List[str]) -> str:
         """Generates a reasoning step (Thought node)"""
         obs_text = "\n".join(observations_so_far) if observations_so_far else "None yet."
-        prompt = f"""You are an advanced step-by-step problem-solving and reasoning agent, that doesn't try to give the full answer on the first step. 
+        prompt = f"""You are an advanced step-by-step problem-solving and reasoning agent, 
+that doesn't try to give the full answer on the first step. 
+
+Did we make any mistakes? Yes? Then identify them, reconsider your plan at that node and regain your thought process. 
+Self correction is the key strategy. 
+
+Internally analyze the goal: identify core outcomes, hidden complexities, implicit constraints, and knowledge gaps.
+
+Break each goal into the smallest practical, independent-yet-interdependent subtasks. 
+Each subtask must:
+- Have a single, verifiable outcome
+- Be completable by an LLM agent in one reasoning pass and one tool call
+- Include explicit success criteria
+- note required knowledge
+- note potential failure nodes
+
+At each step, identify if we have strayed, what *eureka* moments you have, insights, *gotchas* and strategies for continuing to solve. You are a master problem solver that combines the intelligence of the deductive reasoners like Nikola Tesla, Albert Einstein, Steven Hawkings, Thomas Edison, etc. You will be critical and self-evaluating at every step. 
+
+Once you've given the answer, self-verify and self-validate, by travelling backwards from the answer to the request and verify if it is the true answer. If at the end of any process, you've made an error, note the error for the next round to correct. Identify any problems with current logic and reasoning. 
+
+Execute -> Reflect -> Self Correct
+
 Your task is to think step by step about how to answer the user's question.
+
+Consider the framing. Consider the elements of the problem. First understand the primary goal. Then identify any secondary goal. Is this a trick question? How should we break the problem up into sub problems to solve?
 
 Question: {question}
 
@@ -81,13 +104,14 @@ Previous observations (from actions you took):
 {obs_text}
 
 Now, write your thought: what do you know, what are you missing, and what should you do next?
-Keep it concise.
+Keep it concise. Return just your 5 paragraphs of beautifully crafted thought rationale and nothing else.
 """
         return self._call_openai(prompt)
     
     def action(self, thought_text: str) -> Dict[str, Any]:
         """Decides which tool to use (Action node) and returns the action."""
-        prompt = f"""You are an advanced step-by-step problem-solving and reasoning agent, that doesn't try to give the full answer on the first step.
+        prompt = f"""You are an advanced step-by-step problem-solving and reasoning agent, that doesn't try to give the full answer on the first step. Your mission is to fulfill user requests using a systematic agentic methodology.
+
 
 Based on the following thought, decide which tool to call.
 Available tools:
@@ -155,8 +179,9 @@ Return true only if the observation clearly answers the question or if the agent
         """Generate the final answer (Final Answer node)"""
         obs_text = "\n".join(observations)
         thought_text = "\n".join(thoughts)
-        prompt = f"""
-Given the question and all evidence gathered, produce a clear, concise final answer.
+        prompt = f"""You engage in socratic-insanity level of critical analysis of your past understandings and implicit knowledge. You call out perceived contradictions like they are begging to be called out. Draw connections and group data in logical clusters. Consider any past understandings and answer and conclude with what should be the right answer, regardless of what past answers perceived. 
+        
+Given the question and all evidence gathered, produce a clear, concise final answer. Return the final answer and nothing else.
 
 Question: {question}
 
