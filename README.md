@@ -1,8 +1,4 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/g023/gtools/main/assets/gtools-banner.png" alt="gtools banner" width="800">
-</p>
-
-<p align="center">
   <b>⚡ Tiny Model. Giant Possibilities. ⚡</b><br>
   A local‑first agentic toolkit powered entirely by a Qwen3 1.77B parameter LLM running on your machine.
 </p>
